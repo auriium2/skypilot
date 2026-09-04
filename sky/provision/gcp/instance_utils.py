@@ -2,6 +2,8 @@
 import copy
 import enum
 import functools
+import hashlib
+import json
 from multiprocessing import pool
 import re
 import subprocess
@@ -9,6 +11,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
+from sky import exceptions
 from sky import sky_logging
 from sky.adaptors import gcp
 from sky.clouds import gcp as gcp_cloud
@@ -1592,7 +1595,7 @@ class GCPTPUVMInstance(GCPInstance):
 
         if config.get('gcp_queued_resource'):
             return cls._create_queued_resource_instances(
-                names, project_id, zone, config)
+                cluster_name, names, project_id, zone, config)
         else:
             return cls._create_standard_instances(names, project_id, zone,
                                                   config)
@@ -1600,94 +1603,144 @@ class GCPTPUVMInstance(GCPInstance):
     @classmethod
     def _create_queued_resource_instances(
         cls,
+        cluster_name: str,
         names: List[str],
         project_id: str,
         zone: str,
         config: dict,
     ) -> Tuple[Optional[List], List[str]]:
-        operations = []
-        queued_resource_ids = []
-
+        queue_config = config.pop('gcp_queued_resource')
+        external_owner = config.pop('_external_provision', None)
+        if not isinstance(queue_config, dict):
+            queue_config = ({'provisioning_model': 'SPOT'} if config.get(
+                'schedulingConfig', {}).get('preemptible') else {})
+        parent = f'projects/{project_id}/locations/{zone}'
+        if external_owner is not None:
+            # The request body participates in the idempotency hash, so child
+            # node IDs must also survive an executor/API restart unchanged.
+            seed = (f'{cluster_name}:{external_owner["job_id"]}:'
+                    f'{external_owner["task_id"]}:'
+                    f'{external_owner["attempt"]}')
+            stable = hashlib.sha256(seed.encode()).hexdigest()[:8]
+            stable_names = []
+            for i in range(len(names)):
+                role = 'head' if i == 0 else f'worker-{i}'
+                suffix = f'-{role}-{stable}-tpu'
+                stable_names.append(
+                    f'{cluster_name[:INSTANCE_NAME_MAX_LEN-len(suffix)]}'
+                    f'{suffix}')
+            names = stable_names
+        node_specs = []
         for i, name in enumerate(names):
             node_config = config.copy()
+            node_config['labels'] = dict(config.get('labels', {}))
             if i == 0:
                 node_config['labels'].update(provision_constants.HEAD_NODE_TAGS)
             else:
                 node_config['labels'].update(
                     provision_constants.WORKER_NODE_TAGS)
-            node_config.pop('gcp_queued_resource')
-
-            qr_id = f'{name}-q'  # TODO: should this be configurable?
-            parent = f'projects/{project_id}/locations/{zone}'
-
-            qr_body = {
-                'tpu': {
-                    'nodeSpec': {
-                        'parent': parent,
-                        'nodeId': name,
-                        'node': node_config,
-                    }
-                }
-            }
-
-            if config.get('schedulingConfig', {}).get('preemptible'):
-                qr_body['spot'] = {}
             node_config.pop('schedulingConfig', None)
+            node_specs.append({
+                'parent': parent,
+                'nodeId': name,
+                'node': node_config,
+            })
 
-            logger.debug(
-                f'Creating Queued Resource {qr_id} with body: {qr_body}')
-            try:
-                request = cls.load_resource().projects().locations(
-                ).queuedResources().create(parent=parent,
-                                           queuedResourceId=qr_id,
-                                           body=qr_body)
-                operation = request.execute(num_retries=GCP_CREATE_MAX_RETRIES)
-                operations.append(operation)
-                queued_resource_ids.append(qr_id)
+        qr_body = {'tpu': {'nodeSpec': node_specs}}
+        model = str(queue_config.get('provisioning_model', '')).upper()
+        if model and model != 'BEST_EFFORT':
+            qr_body['provisioningModel'] = model
+        if model == 'SPOT':
+            qr_body['spot'] = {}
+        elif model == 'BEST_EFFORT':
+            qr_body['bestEffort'] = {}
+        elif model == 'FLEX_START':
+            max_duration = queue_config.get('max_run_duration')
+            if not max_duration:
+                raise ValueError('FLEX_START requires max_run_duration.')
+            qr_body['runDuration'] = {'maxRunDuration': max_duration}
+        elif model == 'RESERVATION_BOUND':
+            reservation = queue_config.get('reservation_name')
+            if not reservation:
+                raise ValueError(
+                    'RESERVATION_BOUND requires reservation_name.')
+            qr_body['reservationName'] = reservation
+        queueing_policy = {}
+        for source, target in (
+            ('valid_after_time', 'validAfterTime'),
+            ('valid_until_time', 'validUntilTime'),
+            ('valid_after_duration', 'validAfterDuration'),
+            ('valid_until_duration', 'validUntilDuration'),
+        ):
+            value = queue_config.get(source)
+            if value is not None:
+                queueing_policy[target] = value
+        if queueing_policy:
+            qr_body['queueingPolicy'] = queueing_policy
 
-            except gcp.http_error_exception() as e:
-                error_details = getattr(e, 'error_details', [])
-                logger.debug(
-                    f'create_instances: googleapiclient.errors.HttpError: {e}')
-                errors = []
-                if isinstance(error_details, str):
-                    errors.append({
-                        'code': 'CREATION_FAILED',
-                        'domain': 'create_instances',
-                        'message': error_details,
-                    })
-                    _format_and_log_message_from_errors(errors, e, zone)
-                    return errors, names
-                for detail in error_details:
-                    # To be consistent with error messages returned by operation
-                    # wait.
-                    violations = detail.get('violations', [])
-                    if not violations:
-                        errors.append({
-                            'code': detail.get('reason'),
-                            'domain': detail.get('domain'),
-                            'message': detail.get('message', str(e)),
-                        })
-                    else:
-                        for violation in violations:
-                            errors.append({
-                                'code': detail.get('@type'),
-                                'domain': violation.get('subject'),
-                                'message': violation.get('description'),
-                            })
-                _format_and_log_message_from_errors(errors, e, zone)
-                return errors, names
+        canonical = json.dumps(qr_body, sort_keys=True, separators=(',', ':'))
+        request_hash = hashlib.sha256(canonical.encode()).hexdigest()
+        qr_id = f'{cluster_name[:48]}-q-{request_hash[:8]}'[:63].rstrip('-')
+        persisted_request = copy.deepcopy(qr_body)
+        for spec in persisted_request.get('tpu', {}).get('nodeSpec', []):
+            # Provider metadata may contain SSH public keys, startup scripts,
+            # or other user data. It is needed for submission and the hash but
+            # not reconciliation; never retain it in the managed-job DB.
+            spec.get('node', {}).pop('metadata', None)
 
-        logger.debug('Waiting GCP instances to be ready (Queued Resources) ...')
-
-        # 1. Wait for creation operations
-        for operation in operations:
+        if external_owner is None or not queue_config.get('asynchronous', False):
+            operation = cls.load_resource().projects().locations(
+            ).queuedResources().create(parent=parent,
+                                       queuedResourceId=qr_id,
+                                       body=qr_body).execute(
+                                           num_retries=GCP_CREATE_MAX_RETRIES)
             cls.wait_for_operation(operation, project_id, zone=zone)
-
-        # 2. Wait for Queued Resources to be ACTIVE
-        for qr_id in queued_resource_ids:
             cls.wait_for_queued_resource(project_id, zone, qr_id)
-        return None, names
+            return None, names
+
+        from sky.jobs import external_provision  # pylint: disable=import-outside-toplevel
+        record = external_provision.create_or_get(
+            job_id=int(external_owner['job_id']),
+            task_id=int(external_owner['task_id']),
+            attempt=int(external_owner['attempt']),
+            cluster_name=str(external_owner['cluster_name']),
+            cluster_name_on_cloud=cluster_name,
+            provider='gcp_tpu_queued_resource', project=project_id,
+            region=zone.rsplit('-', 1)[0], zone=zone,
+            provider_resource_id=qr_id, request_hash=request_hash,
+            request=persisted_request)
+        if record['state'] == external_provision.ExternalProvisionState.ACTIVE.value:
+            return None, names
+        if record['state'] in external_provision.TERMINAL_STATES:
+            error = common.ProvisionerError(
+                record.get('last_error_message') or
+                'The provider queue request is terminal.')
+            error.errors = [{
+                'code': record.get('last_error_code') or record['state'],
+                'message': record.get('last_error_message') or record['state'],
+                'domain': 'queued_resource',
+            }]
+            raise error
+
+        try:
+            operation = cls.load_resource().projects().locations(
+            ).queuedResources().create(parent=parent,
+                                       queuedResourceId=qr_id,
+                                       body=qr_body).execute(
+                                           num_retries=GCP_CREATE_MAX_RETRIES)
+            cls.wait_for_operation(operation, project_id, zone=zone)
+        except gcp.http_error_exception() as e:
+            # Deterministic ID makes a crash-after-create recoverable.
+            status = getattr(e, 'status_code', None)
+            if status is None:
+                status = getattr(getattr(e, 'resp', None), 'status', None)
+            if status != 409:
+                raise
+        external_provision.update(
+            record['id'],
+            local_state=external_provision.ExternalProvisionState.QUEUED.value,
+            provider_state='ACCEPTED', next_poll_at=time.time() + 10)
+        raise exceptions.ManagedJobProvisioningDeferredError(record['id'])
 
     @classmethod
     def _create_standard_instances(

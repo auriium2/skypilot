@@ -2580,6 +2580,12 @@ def _update_cluster_status(
     node_statuses = _query_cluster_status_via_cloud_api(
         handle, retry_if_missing=retry_if_missing)
 
+    if getattr(handle, 'external_provision_id', None) is not None:
+        # Provider-queued capacity is intentionally INIT and has no SSH/Ray
+        # runtime yet.  Its dedicated reconciler owns state transitions; the
+        # generic health path must not diagnose or remove it as abnormal.
+        return record
+
     all_nodes_up = (all(status[0] == status_lib.ClusterStatus.UP
                         for status in node_statuses.values()) and
                     len(node_statuses) == handle.launched_nodes)

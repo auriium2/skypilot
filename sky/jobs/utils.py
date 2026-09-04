@@ -2702,6 +2702,7 @@ def get_managed_job_queue(
     # an extra DB round trip. `job['status']` is already stringified above.
     recovery_reasons: Dict[int, str] = {}
     pending_reasons: Dict[int, str] = {}
+    external_waiting_details: Dict[int, str] = {}
     if not fields or 'details' in fields:
         recovering_job_ids = [
             job['job_id'] for job in jobs if job['status'] ==
@@ -2715,6 +2716,9 @@ def get_managed_job_queue(
         recovery_reasons, pending_reasons = (
             managed_job_state.get_latest_recovery_and_pending_reasons(
                 recovering_job_ids, pending_job_ids))
+        from sky.jobs import external_provision  # pylint: disable=import-outside-toplevel
+        external_waiting_details = external_provision.get_waiting_details(
+            [job['job_id'] for job in jobs])
 
     for job in jobs:
         if not fields or 'details' in fields:
@@ -2723,6 +2727,8 @@ def get_managed_job_queue(
                 highest_blocking_priority=highest_blocking_priority,
                 recovery_reason=recovery_reasons.get(job['job_id']),
                 pending_reason=pending_reasons.get(job['job_id']))
+            if job['job_id'] in external_waiting_details:
+                job['details'] = external_waiting_details[job['job_id']]
 
         # Derive is_job_group from execution column
         job['is_job_group'] = (

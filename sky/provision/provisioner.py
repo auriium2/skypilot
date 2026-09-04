@@ -81,6 +81,11 @@ def _bulk_provision(
                                                cluster_name.name_on_cloud,
                                                config=config)
 
+    if provision_record.external_provision_id is not None:
+        logger.info('Provider-side capacity request submitted; deferring '
+                    'instance and runtime readiness checks.')
+        return provision_record
+
     # Kubernetes-based clouds' run_instances already synchronously wait for all
     # pods to be scheduled and running, and their wait_instances is a no-op,
     # so skip the post-run wait/retry loop entirely.

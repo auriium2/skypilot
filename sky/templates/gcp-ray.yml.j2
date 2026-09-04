@@ -70,6 +70,9 @@ provider:
   # leakage.
   disable_launch_config_check: true
   use_managed_instance_group: {{ gcp_use_managed_instance_group }}
+{%- if gcp_external_provision is defined and gcp_external_provision %}
+  _external_provision: {{ gcp_external_provision | tojson }}
+{%- endif %}
 {%- if enable_gvnic %}
   enable_gvnic: {{ enable_gvnic }}
 {%- endif %}
@@ -142,7 +145,10 @@ available_node_types:
         preemptible: true
   {%- endif %}
   {%- if gcp_queued_resource %}
-      gcp_queued_resource: {{gcp_queued_resource}}
+      gcp_queued_resource: {{ gcp_queued_resource | tojson }}
+    {%- if gcp_external_provision is defined and gcp_external_provision %}
+      _external_provision: {{ gcp_external_provision | tojson }}
+    {%- endif %}
   {%- endif %}
 {%- else %}
       machineType: {{instance_type}}

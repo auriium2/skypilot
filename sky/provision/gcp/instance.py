@@ -6,6 +6,7 @@ import re
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type
 
+from sky import exceptions
 from sky import sky_logging
 from sky.adaptors import gcp
 from sky.provision import common
@@ -76,6 +77,7 @@ def query_instances(
     handler: Type[
         instance_utils.GCPInstance] = instance_utils.GCPComputeInstance
     use_tpu_vms = provider_config.get('_has_tpus', False)
+
     if use_tpu_vms:
         handler = instance_utils.GCPTPUVMInstance
 
@@ -157,6 +159,13 @@ def _run_instances(region: str, cluster_name_on_cloud: str,
     node_type = instance_utils.get_node_type(config.node_config)
     project_id = config.provider_config['project_id']
     availability_zone = config.provider_config['availability_zone']
+    from sky.jobs import external_provision  # pylint: disable=import-outside-toplevel
+    queued_provision = external_provision.get_by_cluster(cluster_name_on_cloud)
+    if queued_provision is not None and queued_provision['state'] == (
+            external_provision.ExternalProvisionState.ACTIVE.value):
+        external_provision.update(
+            queued_provision['id'], local_state=external_provision.
+            ExternalProvisionState.FINALIZING.value)
 
     # SKY: 'TERMINATED' for compute VM, 'STOPPED' for TPU VM
     # 'STOPPING' means the VM is being stopped, which needs
@@ -294,15 +303,26 @@ def _run_instances(region: str, cluster_name_on_cloud: str,
             )
 
     if to_start_count > 0:
-        errors, created_instance_ids = resource.create_instances(
-            cluster_name_on_cloud,
-            project_id,
-            availability_zone,
-            config.node_config,
-            labels,
-            to_start_count,
-            total_count=config.count,
-            include_head_node=head_instance_id is None)
+        try:
+            errors, created_instance_ids = resource.create_instances(
+                cluster_name_on_cloud,
+                project_id,
+                availability_zone,
+                config.node_config,
+                labels,
+                to_start_count,
+                total_count=config.count,
+                include_head_node=head_instance_id is None)
+        except exceptions.ManagedJobProvisioningDeferredError as e:
+            return common.ProvisionRecord(
+                provider_name='gcp',
+                region=region,
+                zone=availability_zone,
+                cluster_name=cluster_name_on_cloud,
+                head_instance_id='',
+                resumed_instance_ids=[],
+                created_instance_ids=[],
+                external_provision_id=e.external_provision_id)
         if errors:
             error = common.ProvisionerError('Failed to launch instances.')
             error.errors = errors
@@ -352,13 +372,14 @@ def _run_instances(region: str, cluster_name_on_cloud: str,
             tpu_node,
             vpc_name,
         )
-    return common.ProvisionRecord(provider_name='gcp',
-                                  region=region,
-                                  zone=availability_zone,
-                                  cluster_name=cluster_name_on_cloud,
-                                  head_instance_id=head_instance_id,
-                                  resumed_instance_ids=resumed_instance_ids,
-                                  created_instance_ids=created_instance_ids)
+    result = common.ProvisionRecord(provider_name='gcp',
+                                    region=region,
+                                    zone=availability_zone,
+                                    cluster_name=cluster_name_on_cloud,
+                                    head_instance_id=head_instance_id,
+                                    resumed_instance_ids=resumed_instance_ids,
+                                    created_instance_ids=created_instance_ids)
+    return result
 
 
 def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
@@ -415,6 +436,22 @@ def get_cluster_info(
         instance_utils.GCPComputeInstance
     ]
     use_tpu_vms = provider_config.get('_has_tpus', False)
+    from sky.jobs import external_provision  # pylint: disable=import-outside-toplevel
+    queued = external_provision.get_by_cluster(cluster_name_on_cloud)
+    waiting_states = (
+        external_provision.ExternalProvisionState.SUBMITTING.value,
+        external_provision.ExternalProvisionState.QUEUED.value,
+        external_provision.ExternalProvisionState.PROVISIONING.value,
+    )
+    if queued is not None and queued['state'] in waiting_states:
+        # No node is expected before the provider queue becomes ACTIVE. Return
+        # the provisioner's declared type; callers rely on ClusterInfo methods
+        # even when the cluster intentionally has no instances yet. ACTIVE and
+        # FINALIZING must fall through so resume can discover the real node.
+        return common.ClusterInfo(instances={},
+                                  head_instance_id=None,
+                                  provider_name='gcp',
+                                  provider_config=provider_config)
     if use_tpu_vms:
         handlers.append(instance_utils.GCPTPUVMInstance)
 
@@ -529,6 +566,18 @@ def terminate_instances(
     zone = provider_config['availability_zone']
     project_id = provider_config['project_id']
     use_tpu_vms = provider_config.get('_has_tpus', False)
+
+    # A queued TPU request exists before its nodes and outlives them unless the
+    # parent resource is explicitly deleted.  Mark durable cancellation first;
+    # the shared reconciler performs idempotent provider deletion.
+    from sky.jobs import external_provision  # pylint: disable=import-outside-toplevel
+    external = external_provision.get_by_cluster(cluster_name_on_cloud)
+    if external is not None and external['state'] not in (
+            external_provision.ExternalProvisionState.CANCELLED.value,
+            external_provision.ExternalProvisionState.FAILED.value,
+            external_provision.ExternalProvisionState.EXPIRED.value):
+        external_provision.request_cancel(external['job_id'],
+                                          external['task_id'])
 
     tpu_node = provider_config.get('tpu_node')
     if tpu_node is not None:

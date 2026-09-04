@@ -516,6 +516,7 @@ class JobController:
         # Only do the initial cluster launch if not resuming from a controller
         # failure. Otherwise, we will transit to recovering immediately.
         remote_job_submitted_at = time.time()
+        resumed_external = False
         if not is_resume:
             launch_start = time.time()
 
@@ -527,6 +528,12 @@ class JobController:
             launch_time = time.time() - launch_start
             logger.info(f'Cluster launch completed in {launch_time:.2f}s')
             assert remote_job_submitted_at is not None, remote_job_submitted_at
+        else:
+            resumed_at = await (
+                self._strategy_executor.resume_external_provisioning())
+            if resumed_at is not None:
+                remote_job_submitted_at = resumed_at
+                resumed_external = True
         job_id_on_pool_cluster: Optional[int] = None
         if self._pool:
             # Update the cluster name when using pool.
@@ -550,7 +557,7 @@ class JobController:
                 raise asyncio.CancelledError()
         assert cluster_name is not None, (cluster_name, job_id_on_pool_cluster)
 
-        if not is_resume:
+        if not is_resume or resumed_external:
             await managed_job_state.set_started_async(
                 job_id=self._job_id,
                 task_id=task_id,
@@ -577,7 +584,7 @@ class JobController:
         # If resuming from a controller failure, check the previous state
         # and determine if we need to force recovery.
         force_transit_to_recovering = False
-        if is_resume:
+        if is_resume and not resumed_external:
             prev_status = await (
                 managed_job_state.get_job_status_with_task_id_async(
                     job_id=self._job_id, task_id=task_id))
@@ -2309,6 +2316,8 @@ class ControllerManager:
                 job_id=job_id,
                 callback_func=managed_job_utils.event_callback_func(
                     job_id=job_id, task_id=task_id, task=dag.tasks[task_id]))
+            from sky.jobs import external_provision  # pylint: disable=import-outside-toplevel
+            await asyncio.to_thread(external_provision.request_cancel, job_id)
 
             # Download logs before cleanup so they remain accessible after
             # cancellation. This is best-effort - if the cluster is already
@@ -2336,6 +2345,9 @@ class ControllerManager:
                                     graceful_timeout=graceful_timeout)
                 logger.info(
                     f'Cluster of managed job {job_id} has been cleaned up.')
+                from sky.jobs import external_provision  # pylint: disable=import-outside-toplevel
+                await asyncio.to_thread(
+                    external_provision.wait_for_job_cleanup, job_id)
             except Exception as e:  # pylint: disable=broad-except
                 failure_reason = ('Failed to clean up: '
                                   f'{common_utils.format_exception(e)}')

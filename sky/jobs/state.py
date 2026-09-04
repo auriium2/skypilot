@@ -247,6 +247,43 @@ batch_state_table = sqlalchemy.Table(
     sqlalchemy.PrimaryKeyConstraint('job_id', 'batch_idx'),
 )
 
+# Durable ownership for provider-side queues.  This table intentionally lives
+# beside managed-job state: the API executor that submits infrastructure and
+# the managed controller that owns the job are different processes.
+external_provisions_table = sqlalchemy.Table(
+    'external_provisions',
+    Base.metadata,
+    sqlalchemy.Column('id', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('job_id', sqlalchemy.Integer, nullable=False, index=True),
+    sqlalchemy.Column('task_id', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('attempt', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('cluster_name', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('cluster_name_on_cloud', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('provider', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('project', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('region', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('zone', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('provider_resource_id', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('request_hash', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('request_json', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('state', sqlalchemy.Text, nullable=False, index=True),
+    sqlalchemy.Column('provider_state', sqlalchemy.Text),
+    sqlalchemy.Column('created_at', sqlalchemy.Float, nullable=False),
+    sqlalchemy.Column('updated_at', sqlalchemy.Float, nullable=False),
+    sqlalchemy.Column('active_at', sqlalchemy.Float),
+    sqlalchemy.Column('terminal_at', sqlalchemy.Float),
+    sqlalchemy.Column('next_poll_at', sqlalchemy.Float, nullable=False,
+                      index=True),
+    sqlalchemy.Column('poll_attempt', sqlalchemy.Integer, nullable=False,
+                      server_default='0'),
+    sqlalchemy.Column('cancel_requested_at', sqlalchemy.Float),
+    sqlalchemy.Column('last_error_code', sqlalchemy.Text),
+    sqlalchemy.Column('last_error_message', sqlalchemy.Text),
+    sqlalchemy.UniqueConstraint('job_id', 'task_id', 'attempt'),
+    sqlalchemy.UniqueConstraint('provider', 'project', 'zone',
+                                'provider_resource_id'),
+)
+
 # Subquery that aggregates batch_state into per-job progress counts.
 # Used by jobs-queue queries to supply batch_total_batches and
 # batch_completed_batches without denormalized columns on job_info.
@@ -2019,6 +2056,33 @@ def get_task_specs(job_id: int, task_id: int) -> Dict[str, Any]:
                     spot_table.c.task_id == task_id,
                 ))).fetchone()
         return json.loads(task_specs[0])
+
+
+def get_task_recovery_count(job_id: int, task_id: int) -> int:
+    """Return the durable recovery count used to identify launch attempts."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(spot_table.c.recovery_count).where(
+                sqlalchemy.and_(spot_table.c.spot_job_id == job_id,
+                                spot_table.c.task_id == task_id))).fetchone()
+        if row is None or row[0] is None:
+            return 0
+        return int(row[0])
+
+
+@db_retries.retry
+def set_status_override(job_id: int, task_id: int,
+                        status_override: Optional[str]) -> None:
+    """Set an optional display-only managed task status."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        session.execute(
+            sqlalchemy.update(spot_table).where(
+                sqlalchemy.and_(spot_table.c.spot_job_id == job_id,
+                                spot_table.c.task_id == task_id)).values(
+                                    status_override=status_override))
+        session.commit()
 
 
 def scheduler_set_waiting(job_ids: List[int],

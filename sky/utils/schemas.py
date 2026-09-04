@@ -1893,6 +1893,38 @@ def get_config_schema():
                         }
                     }
                 },
+                'tpu_provisioning': {
+                    'type': 'object',
+                    'required': [],
+                    'additionalProperties': False,
+                    'properties': {
+                        'enabled': {
+                            'type': 'boolean',
+                        },
+                        'asynchronous': {
+                            'type': 'boolean',
+                        },
+                        'provisioning_model': {
+                            'type': 'string',
+                            'case_insensitive_enum': [
+                                'FLEX_START', 'SPOT', 'STANDARD',
+                                'RESERVATION_BOUND', 'BEST_EFFORT'
+                            ],
+                        },
+                        'max_run_duration': {
+                            'type': 'string',
+                            'pattern': '^[1-9][0-9]*s$',
+                        },
+                        'ordered_resource_wait_timeout': {
+                            'type': 'string',
+                            'pattern': '^[1-9][0-9]*s$',
+                        },
+                        'single_resource_wait_timeout': {
+                            'type': 'string',
+                            'pattern': '^[1-9][0-9]*s$',
+                        },
+                    },
+                },
                 'force_enable_external_ips': {
                     'type': 'boolean'
                 },

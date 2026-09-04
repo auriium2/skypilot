@@ -753,6 +753,14 @@ class ExecutionPausedError(ExecutionRetryableError):
                                  self.continue_condition))
 
 
+class ManagedJobProvisioningDeferredError(Exception):
+    """A managed job's provider request is durably queued, not failed."""
+
+    def __init__(self, external_provision_id: str) -> None:
+        super().__init__('Waiting for provider capacity')
+        self.external_provision_id = external_provision_id
+
+
 class ExecutionPoolFullError(Exception):
     """Raised when the execution pool is full."""
 

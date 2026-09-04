@@ -162,7 +162,16 @@ class StrategyExecutor:
         passed through ``sdk.launch()`` to the provisioner's
         ``template_override()``.
         """
-        return {}
+        return {
+            'managed_job': {
+                'job_id': self.job_id,
+                'task_id': self.task_id,
+                # recovery_count is advanced only after recovery succeeds.
+                # The in-progress attempt is therefore the current count.
+                'attempt': state.get_task_recovery_count(self.job_id,
+                                                         self.task_id),
+            }
+        }
 
     def task_specs(self) -> Dict[str, Any]:
         """Return strategy-specific keys for the persisted task specs.
@@ -178,6 +187,44 @@ class StrategyExecutor:
         Subclasses use this to rehydrate state from persisted handles.
         """
         return None
+
+    async def _wait_for_external_provision(self, record_id: str) -> bool:
+        """Wait on durable local state; return False for provider failure."""
+        from sky.jobs import external_provision  # pylint: disable=import-outside-toplevel
+        while True:
+            record = external_provision.get_by_id(record_id)
+            if record is None:
+                raise RuntimeError(
+                    'Lost durable TPU provisioning ownership record.')
+            if record['state'] in (
+                    external_provision.ExternalProvisionState.ACTIVE.value,
+                    external_provision.ExternalProvisionState.FINALIZING.value):
+                return True
+            if record['state'] in external_provision.TERMINAL_STATES:
+                handle = global_user_state.get_handle_from_cluster_name(
+                    self.cluster_name)
+                if handle is not None:
+                    self.dag.tasks[0].blocked_resources = {
+                        handle.launched_resources
+                    }
+                await asyncio.to_thread(self._cleanup_cluster)
+                logger.info('Provider queue ended in %s; trying the next '
+                            'ordered resource.', record['state'])
+                return False
+            await asyncio.sleep(15)
+
+    async def resume_external_provisioning(self) -> Optional[float]:
+        """Resume a deferred provider request after controller restart."""
+        from sky.jobs import external_provision  # pylint: disable=import-outside-toplevel
+        record = external_provision.get_latest(self.job_id, self.task_id)
+        if record is None or record['state'] in external_provision.TERMINAL_STATES:
+            return None
+        logger.info('Reattached to deferred TPU request %s after controller '
+                    'restart.', record['provider_resource_id'])
+        active = await self._wait_for_external_provision(record['id'])
+        if not active:
+            return await self._launch(recovery=False)
+        return await self._launch(recovery=False)
 
     async def monitor_task(  # pylint: disable=unused-argument
         self,
@@ -607,6 +654,11 @@ class StrategyExecutor:
                             request_id = None
                             try:
                                 extra_ctx = self.extra_launch_context()
+                                if 'managed_job' in extra_ctx:
+                                    extra_ctx['managed_job']['attempt'] = (
+                                        state.get_task_recovery_count(
+                                            self.job_id, self.task_id) +
+                                        (1 if recovery else 0))
                                 request_id = await asyncio.to_thread(
                                     sdk.launch,
                                     self.dag,
@@ -632,11 +684,19 @@ class StrategyExecutor:
                                 # to drive the provisioning spinner shown by
                                 # `sky jobs launch` / `sky jobs logs`, matching
                                 # the `sky launch` experience.
-                                await asyncio.to_thread(
+                                launch_result = await asyncio.to_thread(
                                     sdk.stream_and_get,
                                     request_id,
                                     relay_rich_status=True,
                                 )
+                                launched_handle = launch_result[1]
+                                external_id = getattr(
+                                    launched_handle, 'external_provision_id',
+                                    None)
+                                if external_id is not None:
+                                    raise (exceptions.
+                                           ManagedJobProvisioningDeferredError(
+                                               external_id))
                             except asyncio.CancelledError:
                                 if request_id:
                                     req = await asyncio.to_thread(
@@ -697,6 +757,11 @@ class StrategyExecutor:
                             await state.set_job_id_on_pool_cluster_async(
                                 self.job_id, job_id_on_pool_cluster)
                         logger.info('Managed job cluster launched.')
+                    except exceptions.ManagedJobProvisioningDeferredError:
+                        # This is a successful provider submission, not a
+                        # failed launch. Let scheduled_launch release admission
+                        # and let the outer durable-wait handler take over.
+                        raise
                     except (exceptions.InvalidClusterNameError,
                             exceptions.NoCloudAccessError,
                             exceptions.ResourcesMismatchError,
@@ -846,6 +911,12 @@ class StrategyExecutor:
                     # allows other jobs to launch.
                     raise exceptions.NoClusterLaunchedError()
 
+            except exceptions.ManagedJobProvisioningDeferredError as e:
+                logger.info('TPU request is waiting for provider capacity; '
+                            'the managed-job launch slot is released.')
+                await self._wait_for_external_provision(
+                    e.external_provision_id)
+                continue
             except exceptions.NoClusterLaunchedError:
                 # Update the status to PENDING during backoff.
                 await state.set_backoff_pending_async(self.job_id, self.task_id)

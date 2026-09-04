@@ -144,6 +144,9 @@ class ProvisionRecord:
     # Metadata about the runtime materialized by provisioning.
     runtime_metadata: ProvisionRuntimeMetadata = dataclasses.field(
         default_factory=ProvisionRuntimeMetadata)
+    # Non-None when a provider-side queue accepted the request but no instance
+    # exists yet. Managed jobs release launch admission and resume later.
+    external_provision_id: Optional[str] = None
 
     def is_instance_just_booted(self, instance_id: InstanceId) -> bool:
         """Whether or not the instance is just booted.

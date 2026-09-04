@@ -1138,6 +1138,58 @@ class RetryingVmProvisioner(object):
             for failover_overrides in to_provision.cloud.yield_cloud_specific_failover_overrides(
                     region=to_provision.region):
                 try:
+                    # Managed TPU jobs use the server's central provider policy;
+                    # users request a TPU, not a Google queueing mechanism.
+                    if (isinstance(to_provision.cloud, clouds.GCP) and
+                            self._is_launched_by_jobs_controller and
+                            to_provision.accelerators and any(
+                                'tpu' in name.lower()
+                                for name in to_provision.accelerators)):
+                        policy = skypilot_config.get_effective_region_config(
+                            cloud='gcp', region=region.name,
+                            keys=('tpu_provisioning',), default_value={
+                                'enabled': True,
+                                'asynchronous': True,
+                                'provisioning_model': 'FLEX_START',
+                                'max_run_duration': '86400s',
+                                'ordered_resource_wait_timeout': '21600s',
+                                'single_resource_wait_timeout': '86400s',
+                            })
+                        if policy.get('enabled', True):
+                            owner = self._extra_launch_context.get('managed_job')
+                            if owner is None:
+                                raise RuntimeError(
+                                    'Managed TPU provisioning is missing '
+                                    'durable job ownership context.')
+                            normalized = dict(policy)
+                            normalized.setdefault('asynchronous', True)
+                            normalized.setdefault('provisioning_model',
+                                                  'FLEX_START')
+                            normalized.setdefault('max_run_duration', '86400s')
+                            timeout_key = ('ordered_resource_wait_timeout'
+                                           if len(task.resources) > 1 else
+                                           'single_resource_wait_timeout')
+                            normalized['valid_until_duration'] = normalized.get(
+                                timeout_key, '21600s' if len(task.resources) > 1
+                                else '86400s')
+                            if to_provision.use_spot:
+                                normalized['provisioning_model'] = 'SPOT'
+                            # Google rejects FLEX_START for TPU v5e
+                            # (Sky catalog name: v5litepod).  The organization
+                            # has queued Spot quota for this topology, so select
+                            # Spot automatically instead of making workload
+                            # authors know the provider compatibility matrix.
+                            if (str(normalized['provisioning_model']).upper() ==
+                                    'FLEX_START' and any(
+                                        'tpu-v5litepod' in name.lower()
+                                        for name in to_provision.accelerators)):
+                                normalized['provisioning_model'] = 'SPOT'
+                            extra_vars = dict(extra_vars or {})
+                            extra_vars['gcp_queued_resource'] = normalized
+                            extra_vars['gcp_external_provision'] = {
+                                **owner,
+                                'cluster_name': cluster_name,
+                            }
                     config_dict = backend_utils.write_cluster_config(
                         to_provision,
                         num_nodes,
@@ -1973,7 +2025,7 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
     """
     # Bump if any fields get added/removed/changed, and add backward
     # compatibility logic in __setstate__ and/or __getstate__.
-    _VERSION = 13
+    _VERSION = 14
 
     # Set by from_dict() since cached_cluster_info is not available
     # when reconstructing from a dict.
@@ -2023,6 +2075,7 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
                 has_job_queue=False,
                 ssh_available=False,
             ))
+        self.external_provision_id: Optional[str] = None
 
     def __repr__(self):
         return (f'ResourceHandle('
@@ -2647,6 +2700,7 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
             'ssh_user': self.ssh_user,
             'provision_runtime_metadata': dataclasses.asdict(
                 self.provision_runtime_metadata),
+            'external_provision_id': self.external_provision_id,
         }
 
     @classmethod
@@ -2689,6 +2743,7 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
         else:
             handle.provision_runtime_metadata = (
                 provision_common.ProvisionRuntimeMetadata())
+        handle.external_provision_id = d.get('external_provision_id')
         return handle
 
     def __getstate__(self):
@@ -2764,6 +2819,9 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
         if version >= 12:
             # DEPRECATED in favor of skylet_ssh_tunnel_metadata column in the DB
             state.pop('skylet_ssh_tunnel', None)
+
+        if version < 14:
+            state['external_provision_id'] = None
 
         # provision_runtime_metadata is serialized as a plain dict (see
         # __getstate__). Reconstruct the dataclass here, defaulting if absent.
@@ -3518,6 +3576,17 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 provision_record = config_dict['provision_record']
                 runtime_metadata = provision_record.runtime_metadata
                 handle.provision_runtime_metadata = runtime_metadata
+                if provision_record.external_provision_id is not None:
+                    handle.external_provision_id = (
+                        provision_record.external_provision_id)
+                    global_user_state.update_cluster_handle(
+                        handle.cluster_name, handle)
+                    logger.info('Provider queue accepted the request; '
+                                'deferring runtime setup until capacity is '
+                                'active.')
+                    return handle, False
+                # A resumed deferred launch has now produced real instances.
+                handle.external_provision_id = None
                 resources_vars = config_dict['resources_vars']
                 config_hash = config_dict.get('config_hash', None)
 
@@ -3577,6 +3646,10 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 self._update_after_cluster_provisioned(
                     handle, to_provision_config.prev_handle, task,
                     prev_cluster_status, config_hash)
+                if isinstance(handle.launched_resources.cloud, clouds.GCP):
+                    from sky.jobs import external_provision  # pylint: disable=import-outside-toplevel
+                    external_provision.complete_by_cluster(
+                        handle.cluster_name_on_cloud)
                 return handle, False
 
             cluster_config_file = config_dict['ray']
@@ -5289,7 +5362,13 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 f'cluster {handle.cluster_name}: '
                 f'{common_utils.format_exception(e, use_bracket=True)}')
         cluster_status_fetched = False
-        if refresh_cluster_status:
+        if getattr(handle, 'external_provision_id', None) is not None:
+            # Provider-queued capacity has no node or SSH endpoint yet. The
+            # durable external record is authoritative; refreshing through the
+            # normal cluster path would try to materialize ClusterInfo and fail.
+            prev_cluster_status = status_lib.ClusterStatus.INIT
+            cluster_status_fetched = True
+        elif refresh_cluster_status:
             try:
                 prev_cluster_status, refreshed_handle = (
                     backend_utils.refresh_cluster_status_handle(

@@ -55,6 +55,7 @@ import uuid
 
 import filelock
 
+from sky import exceptions
 from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import common as adaptors_common
@@ -426,6 +427,11 @@ async def scheduled_launch(
 
     try:
         yield
+    except exceptions.ManagedJobProvisioningDeferredError:
+        # Provider submission succeeded.  Release launch admission while the
+        # managed controller waits on durable local state.
+        await state.scheduler_set_alive_async(job_id)
+        raise
     except Exception as e:
         raise e
     else:

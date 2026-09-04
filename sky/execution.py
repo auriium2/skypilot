@@ -568,6 +568,12 @@ def _execute_dag(
                 skip_unnecessary_provisioning=skip_unnecessary_provisioning,
                 resize=resize)
 
+        if (isinstance(handle, backends.CloudVmRayResourceHandle) and
+                getattr(handle, 'external_provision_id', None) is not None):
+            job_logger.info('TPU capacity request accepted; waiting in the '
+                            'provider queue without holding a launch slot.')
+            return None, handle
+
         if handle is None:
             assert dryrun, ('If not dryrun, handle must be set or '
                             'Stage.PROVISION must be included in stages.')
