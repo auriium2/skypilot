@@ -2963,8 +2963,11 @@ class GcsStore(AbstractStore):
                                                      mount_path,
                                                      self._bucket_sub_path,
                                                      read_only=read_only)
+        # gcsfuse prints --version to stderr, so merge it or the check never
+        # matches and the root-requiring install reruns every mount.
         version_check_cmd = (
-            f'gcsfuse --version | grep -q {mounting_utils.GCSFUSE_VERSION}')
+            f'gcsfuse --version 2>&1 | '
+            f'grep -q {mounting_utils.GCSFUSE_VERSION}')
         return mounting_utils.get_mounting_command(mount_path, install_cmd,
                                                    mount_cmd, version_check_cmd)
 
