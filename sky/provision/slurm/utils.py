@@ -62,6 +62,25 @@ def expand_path_vars(path: str, env: Dict[str, str]) -> str:
     return _VAR_PATTERN.sub(_repl, path)
 
 
+# A node in any of these offers nothing schedulable, whatever AllocTRES says.
+_UNSCHEDULABLE_NODE_STATES = frozenset({
+    'DOWN', 'DRAIN', 'DRAINING', 'DRAINED', 'FAIL', 'FAILING', 'MAINT',
+    'INVAL', 'UNKNOWN', 'NOT_RESPONDING', 'POWER_DOWN', 'POWERED_DOWN',
+    'POWERING_DOWN',
+})
+
+
+def _tres_gpu_count(tres: str) -> int:
+    """Reads the untyped gres/gpu total from a TRES string.
+
+    Always present when a node has GPUs. The typed form (gres/gpu:b200=8) is
+    emitted alongside it on some clusters and omitted on others, so it cannot be
+    relied on for the count.
+    """
+    match = re.search(r'gres/gpu=(\d+)', tres)
+    return int(match.group(1)) if match else 0
+
+
 def get_gpu_type_and_count(gres_str: str) -> Tuple[Optional[str], int]:
     """Parses GPU type and count from a GRES string.
 
@@ -981,7 +1000,16 @@ def _get_slurm_node_info_list(
     # 2. Process each node, aggregating partitions per node
     slurm_nodes_info: Dict[str, Dict[str, Any]] = {}
 
-    nodes_to_jobs_gres = slurm_client.get_all_jobs_gres()
+    # Slurm's own accounting, rather than a reconstruction from squeue: %b is
+    # empty for jobs requesting GPUs per task or socket, and node states can
+    # carry flags that defeat an equality test.
+    try:
+        node_tres = slurm_client.get_all_node_tres()
+    except Exception as e:  # pylint: disable=broad-except
+        logger.debug(f'Could not fetch node TRES, falling back to squeue: {e}')
+        node_tres = {}
+    nodes_to_jobs_gres = (slurm_client.get_all_jobs_gres()
+                          if not node_tres else {})
     for node_info in node_infos:
         node_name = node_info.node
         state = node_info.state
@@ -1000,28 +1028,35 @@ def _get_slurm_node_info_list(
             else:
                 node_gpu_type = 'GPU'
 
-        # Get allocated GPUs
-        allocated_gpus = 0
-        # TODO(zhwu): move to enum
-        if state in ('alloc', 'mix', 'drain', 'drng', 'drained', 'resv',
-                     'comp'):
-            jobs_gres = nodes_to_jobs_gres.get(node_name, [])
-            if jobs_gres:
-                for job_line in jobs_gres:
-                    _, job_gpu_count = get_gpu_type_and_count(job_line)
-                    allocated_gpus += job_gpu_count
-            elif state == 'alloc':
-                # If no GRES info found but node is fully allocated,
-                # assume all GPUs are in use.
-                allocated_gpus = total_gpus
-        elif state == 'idle':
+        tres = node_tres.get(node_name)
+        if tres is not None:
+            # CfgTRES is authoritative for the total too: sinfo's GRES field can
+            # disagree on nodes whose GRES is partly unconfigured.
+            configured = _tres_gpu_count(tres['cfg_tres'])
+            if configured:
+                total_gpus = configured
+            allocated_gpus = _tres_gpu_count(tres['alloc_tres'])
+            # States are a flag set ('MIXED+DRAIN'), not a single value.
+            flags = set(tres['state'].upper().replace('+', '|').split('|'))
+            unschedulable = bool(flags & _UNSCHEDULABLE_NODE_STATES)
+        else:
+            # Fallback: reconstruct from squeue as before.
             allocated_gpus = 0
+            base_state = state.rstrip('*~#!%$@^-')
+            if base_state in ('alloc', 'mix', 'drain', 'drng', 'drained',
+                              'resv', 'comp'):
+                jobs_gres = nodes_to_jobs_gres.get(node_name, [])
+                if jobs_gres:
+                    for job_line in jobs_gres:
+                        _, job_gpu_count = get_gpu_type_and_count(job_line)
+                        allocated_gpus += job_gpu_count
+                elif base_state == 'alloc':
+                    # If no GRES info found but node is fully allocated,
+                    # assume all GPUs are in use.
+                    allocated_gpus = total_gpus
+            unschedulable = base_state in ('down', 'drain', 'drng', 'maint')
 
-        free_gpus = total_gpus - allocated_gpus if state not in ('down',
-                                                                 'drain',
-                                                                 'drng',
-                                                                 'maint') else 0
-        free_gpus = max(0, free_gpus)
+        free_gpus = 0 if unschedulable else max(0, total_gpus - allocated_gpus)
 
         slurm_nodes_info[node_name] = {
             'node_name': node_name,

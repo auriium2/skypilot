@@ -329,6 +329,35 @@ class SlurmClient:
             stream_logs=False)
         return stdout.splitlines()
 
+    def get_all_node_tres(self) -> Dict[str, Dict[str, str]]:
+        """Gets per-node state and TRES for every node in one call.
+
+        Returns:
+            Dict mapping node name to a dict with 'state', 'gres', 'cfg_tres'
+            and 'alloc_tres' keys.
+        """
+        cmd = 'scontrol show nodes -o'
+        rc, stdout, stderr = self._run_slurm_cmd(cmd)
+        subprocess_utils.handle_returncode(rc,
+                                           cmd,
+                                           'Failed to get node TRES.',
+                                           stderr=f'{stdout}\n{stderr}',
+                                           stream_logs=False)
+        nodes: Dict[str, Dict[str, str]] = {}
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line.startswith('NodeName='):
+                continue
+            fields = dict(
+                part.split('=', 1) for part in line.split() if '=' in part)
+            nodes[fields['NodeName']] = {
+                'state': fields.get('State', ''),
+                'gres': fields.get('Gres', ''),
+                'cfg_tres': fields.get('CfgTRES', ''),
+                'alloc_tres': fields.get('AllocTRES', ''),
+            }
+        return nodes
+
     def get_all_jobs_gres(self) -> Dict[str, List[str]]:
         """Get GRES allocation for all running jobs, grouped by node.
 
