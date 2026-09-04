@@ -975,6 +975,7 @@ def terminate_instances(
     if slurm_utils.is_inside_slurm_cluster():
         logger.debug('Running inside a Slurm cluster, using local execution')
         client = slurm.SlurmClient(is_inside_slurm_cluster=True)
+        cleanup_on_login = False
     else:
         ssh_config_dict = provider_config['ssh']
         ssh_host = ssh_config_dict['hostname']
@@ -994,10 +995,46 @@ def terminate_instances(
             ssh_proxy_jump=ssh_proxy_jump,
             identities_only=identities_only,
         )
+        cleanup_on_login = True
+
+    def _cleanup_cluster_home() -> None:
+        """Remove NFS state after the allocation can no longer race us.
+
+        The batch script also has an EXIT trap, but scancel may kill the
+        allocation before a large NFS rm finishes. Running this from the login
+        node is independent of the allocation and also covers jobs that have
+        already disappeared from squeue.
+        """
+        if not cleanup_on_login:
+            return
+        remote_home = client.get_remote_home_dir()
+        workdir = skypilot_config.get_effective_region_config(
+            cloud='slurm',
+            region=provider_config.get('cluster'),
+            keys=('workdir',),
+            default_value=None)
+        if workdir is not None:
+            workdir = slurm_utils.expand_path_vars(workdir, client.get_env())
+        base_dir = workdir if workdir is not None else remote_home
+        cluster_home = _sky_cluster_home_dir(base_dir, cluster_name_on_cloud)
+        expected_parent = os.path.join(os.path.abspath(base_dir),
+                                       '.sky_clusters')
+        assert os.path.dirname(os.path.abspath(cluster_home)) == expected_parent
+        cmd = f'rm -rf --one-file-system {shlex.quote(cluster_home)}'
+        rc, stdout, stderr = client._run_slurm_cmd(cmd)  # pylint: disable=protected-access
+        subprocess_utils.handle_returncode(
+            rc,
+            cmd,
+            f'Failed to clean Slurm cluster home {cluster_home}.',
+            stderr=f'{stdout}\n{stderr}',
+            stream_logs=False)
+        logger.debug(f'Cleaned Slurm cluster home {cluster_home}.')
+
     jobs_state = client.get_jobs_state_by_name(cluster_name_on_cloud)
     if not jobs_state:
         logger.debug(f'Job for cluster {cluster_name_on_cloud} not found, '
                      'it may have been terminated.')
+        _cleanup_cluster_home()
         return
     assert len(jobs_state) == 1, (
         f'Multiple jobs found for cluster {cluster_name_on_cloud}: {jobs_state}'
@@ -1012,7 +1049,8 @@ def terminate_instances(
     if job_state in terminal_states:
         logger.debug(
             f'Job for cluster {cluster_name_on_cloud} is already in a terminal '
-            f'state {job_state}. No action needed.')
+            f'state {job_state}. Cleaning residual state.')
+        _cleanup_cluster_home()
         return
 
     if job_state in ('PENDING', 'CONFIGURING'):
@@ -1028,6 +1066,20 @@ def terminate_instances(
         client.cancel_jobs_by_name(cluster_name_on_cloud,
                                    signal='TERM',
                                    full=True)
+
+    if cleanup_on_login:
+        deadline = time.time() + _JOB_TERMINATION_TIMEOUT_SECONDS
+        while time.time() < deadline:
+            states = client.get_jobs_state_by_name(cluster_name_on_cloud)
+            if not states or all(state.strip() in terminal_states
+                                 for state in states):
+                break
+            time.sleep(POLL_INTERVAL_SECONDS)
+        else:
+            raise TimeoutError(
+                f'Slurm job {cluster_name_on_cloud} did not terminate within '
+                f'{_JOB_TERMINATION_TIMEOUT_SECONDS} seconds.')
+        _cleanup_cluster_home()
 
 
 def open_ports(
