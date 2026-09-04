@@ -28,8 +28,11 @@ from sky.utils import yaml_utils
 # TODO(luca): The future is now! ^^^
 LONG_WORKER_MEM_GB = 0.4
 SHORT_WORKER_MEM_GB = 0.3
-# To control the number of long workers.
-_CPU_MULTIPLIER_FOR_LONG_WORKERS = 2
+# To control the number of long workers. Kept above LAUNCHES_PER_WORKER so a
+# stalled infra cannot take every slot: a launch blocked on a Slurm maintenance
+# reservation holds one for provision_timeout, which defaults to 24h when a
+# partition is named. A blocked worker is waiting on a socket, not a core.
+_CPU_MULTIPLIER_FOR_LONG_WORKERS = 4
 # Limit the number of long workers of local API server, since local server is
 # typically:
 # 1. launched automatically in an environment with high resource contention
