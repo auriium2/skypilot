@@ -1152,15 +1152,12 @@ def get_command_runners(
     login_node_ssh_proxy_jump = login_node_ssh_config.get('proxyjump', None)
     login_node_identities_only = login_node_ssh_config.get(
         'identities_only', False)
-    # For Slurm, multiple SkyPilot clusters may share the same underlying
-    # Slurm login node. By using a fixed ssh_control_name ('__default__'),
-    # we ensure that all connections to the same login node reuse the same
-    # SSH ControlMaster process, avoiding repeated SSH handshakes.
-    #
-    # The %C token in ControlPath (see ssh_options_list) ensures that
-    # connections to different login nodes use different sockets, avoiding
-    # collisions between different Slurm clusters.
-    ssh_control_name = command_runner.DEFAULT_SSH_CONTROL_NAME
+    # Isolate the ControlMaster by Sky cluster. A login-node-wide master runs
+    # out of server-side SSH channels when many managed jobs poll concurrently
+    # ("Session open refused by peer"). The command runner hashes this name and
+    # %C still separates destinations, so paths remain short and collision-free.
+    # Commands within this cluster continue to reuse one connection.
+    ssh_control_name = cluster_name_on_cloud
 
     client = slurm.SlurmClient(
         login_node_ssh_hostname,

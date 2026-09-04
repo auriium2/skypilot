@@ -114,6 +114,7 @@ class SlurmClient:
         ssh_proxy_jump: Optional[str] = None,
         is_inside_slurm_cluster: bool = False,
         identities_only: Optional[bool] = None,
+        ssh_control_name: Optional[str] = None,
     ):
         """Initialize SlurmClient.
 
@@ -129,6 +130,10 @@ class SlurmClient:
             identities_only: If True, only use the specified identity file and
                 don't try ssh-agent keys. If None, defaults to False (allows
                 ssh-agent fallback for backward compatibility).
+            ssh_control_name: Name used to isolate the OpenSSH ControlMaster
+                socket. Long-lived command runners for a concrete Slurm
+                cluster pass that cluster's name. When unset, the client uses
+                one socket per process.
         """
         self.ssh_host = ssh_host
         self.ssh_port = ssh_port
@@ -156,6 +161,8 @@ class SlurmClient:
                 ssh_key,
                 ssh_proxy_command=ssh_proxy_command,
                 ssh_proxy_jump=ssh_proxy_jump,
+                ssh_control_name=(ssh_control_name or
+                                  f'slurm-process-{command_runner.os.getpid()}'),
                 enable_interactive_auth=True,
                 disable_identities_only=not identities_only,
             )
