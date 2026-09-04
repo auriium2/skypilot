@@ -4,7 +4,7 @@ import ipaddress
 import logging
 import re
 import shlex
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Set, Tuple
 
 from sky.adaptors import common
 from sky.utils import command_runner
@@ -358,6 +358,146 @@ class SlurmClient:
                 'partitions': fields.get('Partitions', ''),
             }
         return nodes
+
+    # Largest range the local expander will materialise, so a malformed or
+    # hostile nodelist cannot balloon memory before the size is noticed.
+    _HOSTLIST_RANGE_LIMIT = 100000
+
+    @staticmethod
+    def _split_hostlist_top_level(nodelist: str) -> List[str]:
+        """Splits on commas outside brackets: 'a[1,2],b3' -> ['a[1,2]', 'b3']."""
+        parts: List[str] = []
+        depth = 0
+        current = ''
+        for char in nodelist:
+            if char == '[':
+                depth += 1
+            elif char == ']':
+                depth -= 1
+            if char == ',' and depth == 0:
+                parts.append(current)
+                current = ''
+            else:
+                current += char
+        if current:
+            parts.append(current)
+        return parts
+
+    @classmethod
+    def _expand_hostlist_locally(cls, nodelist: str) -> Optional[Set[str]]:
+        """Expands a compact Slurm hostlist, or None if the syntax is unknown.
+
+        None means "ask Slurm", never "no nodes", so an unrecognised list can
+        never silently drop reserved nodes out of the blocked set.
+        """
+        nodes: Set[str] = set()
+        for part in cls._split_hostlist_top_level(nodelist):
+            part = part.strip()
+            if not part:
+                continue
+            match = re.fullmatch(r'([A-Za-z][\w.-]*)\[([\d,\-]+)\]', part)
+            if match is None:
+                if re.fullmatch(r'[A-Za-z][\w.-]*', part):
+                    nodes.add(part)
+                    continue
+                return None
+            prefix, spec = match.group(1), match.group(2)
+            for item in spec.split(','):
+                if '-' not in item:
+                    if not item.isdigit():
+                        return None
+                    nodes.add(f'{prefix}{item}')
+                    continue
+                low, _, high = item.partition('-')
+                if not (low.isdigit() and high.isdigit()):
+                    return None
+                start, end = int(low), int(high)
+                if start > end or end - start > cls._HOSTLIST_RANGE_LIMIT:
+                    return None
+                nodes.update(f'{prefix}{i:0{len(low)}d}'
+                             for i in range(start, end + 1))
+        return nodes
+
+    @staticmethod
+    def _split_scontrol_list(value: str) -> Set[str]:
+        """Splits a comma-separated scontrol field, dropping Slurm's (null)."""
+        if not value or value == '(null)':
+            return set()
+        return {item.strip() for item in value.split(',') if item.strip()}
+
+    def expand_nodelists(self, nodelists: List[str]) -> Set[str]:
+        """Expands compact Slurm hostlists (a[0001-0019]) to node names."""
+        joined = ','.join(nodelists)
+        if not re.fullmatch(r'[A-Za-z0-9_,\[\]\-]+', joined):
+            logger.debug(f'Refusing to expand malformed nodelist: {joined}')
+            return set()
+        cmd = f'scontrol show hostnames {shlex.quote(joined)}'
+        rc, stdout, stderr = self._run_slurm_cmd(cmd)
+        if rc != 0:
+            logger.debug(f'Could not expand nodelist {joined}: {stderr}')
+            return set()
+        return {n.strip() for n in stdout.splitlines() if n.strip()}
+
+    def get_blocked_reservation_nodes(self) -> Set[str]:
+        """Nodes held by an active reservation this user cannot enter.
+
+        A reservation withholds its nodes from everyone outside its Users and
+        Accounts lists, so to us those nodes are as unschedulable as drained
+        ones. Returns an empty set on any failure, so an unreadable reservation
+        table degrades to reservation-unaware behavior rather than hiding
+        capacity that is really available.
+        """
+        cmd = ('id -un; echo __SKY_SEP__; '
+               'scontrol show res -o 2>/dev/null; echo __SKY_SEP__; '
+               'sacctmgr -nP show assoc where user=$(id -un) '
+               'format=account 2>/dev/null')
+        rc, stdout, stderr = self._run_slurm_cmd(cmd)
+        if rc != 0:
+            logger.debug(f'Could not read Slurm reservations: {stderr}')
+            return set()
+        sections = stdout.split('__SKY_SEP__')
+        if len(sections) < 2:
+            return set()
+        user_lines = [ln.strip() for ln in sections[0].splitlines() if ln.strip()]
+        username = user_lines[-1] if user_lines else ''
+        accounts: Set[str] = set()
+        if len(sections) > 2:
+            accounts = {a.strip() for a in sections[2].split() if a.strip()}
+        blocked_nodelists: List[str] = []
+        for line in sections[1].splitlines():
+            line = line.strip()
+            if not line.startswith('ReservationName='):
+                continue
+            fields = dict(
+                part.split('=', 1) for part in line.split() if '=' in part)
+            if fields.get('State', '').upper() != 'ACTIVE':
+                continue
+            if username and username in self._split_scontrol_list(
+                    fields.get('Users', '')):
+                continue
+            if accounts & self._split_scontrol_list(fields.get('Accounts', '')):
+                continue
+            nodes = fields.get('Nodes', '')
+            if nodes and nodes != '(null)':
+                blocked_nodelists.append(nodes)
+        if not blocked_nodelists:
+            return set()
+        # Expanding locally keeps this to the single round trip already spent on
+        # the reservation table. On a DERP-relayed link a round trip is ~1.5s,
+        # so round-trip count dominates; scontrol show hostnames stays as the
+        # fallback for syntax the local parser does not recognise.
+        blocked: Set[str] = set()
+        unparsed: List[str] = []
+        for nodelist in blocked_nodelists:
+            expanded = self._expand_hostlist_locally(nodelist)
+            if expanded is None:
+                unparsed.append(nodelist)
+            else:
+                blocked |= expanded
+        if unparsed:
+            logger.debug(f'Unfamiliar hostlist syntax, asking Slurm: {unparsed}')
+            blocked |= self.expand_nodelists(unparsed)
+        return blocked
 
     def get_partition_qos(self) -> Dict[str, Optional[str]]:
         """Gets each partition's QOS name.

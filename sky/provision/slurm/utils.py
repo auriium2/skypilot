@@ -1299,6 +1299,16 @@ def _get_slurm_node_info_list(
         node_tres = {}
     nodes_to_jobs_gres = (slurm_client.get_all_jobs_gres()
                           if not node_tres else {})
+    # Nodes inside an active reservation we are not listed on cannot be had at
+    # any price. Counting them free makes a request pass its precheck, then sit
+    # PENDING with 'ReqNodeNotAvail, Reserved for maintenance' while holding an
+    # API server long-worker slot for provision_timeout, 24h by default.
+    try:
+        blocked_by_reservation = slurm_client.get_blocked_reservation_nodes()
+    except Exception as e:  # pylint: disable=broad-except
+        logger.debug(f'Could not read reservations for {slurm_cluster_name}, '
+                     f'treating all nodes as reachable: {e}')
+        blocked_by_reservation = set()
     for node_info in node_infos:
         node_name = node_info.node
         state = node_info.state
@@ -1327,7 +1337,8 @@ def _get_slurm_node_info_list(
             allocated_gpus = _tres_gpu_count(tres['alloc_tres'])
             # States are a flag set ('MIXED+DRAIN'), not a single value.
             flags = set(tres['state'].upper().replace('+', '|').split('|'))
-            unschedulable = bool(flags & _UNSCHEDULABLE_NODE_STATES)
+            unschedulable = (bool(flags & _UNSCHEDULABLE_NODE_STATES) or
+                             node_name in blocked_by_reservation)
         else:
             # Fallback: reconstruct from squeue as before.
             allocated_gpus = 0
@@ -1343,7 +1354,9 @@ def _get_slurm_node_info_list(
                     # If no GRES info found but node is fully allocated,
                     # assume all GPUs are in use.
                     allocated_gpus = total_gpus
-            unschedulable = base_state in ('down', 'drain', 'drng', 'maint')
+            unschedulable = (base_state
+                             in ('down', 'drain', 'drng', 'maint') or
+                             node_name in blocked_by_reservation)
 
         free_gpus = 0 if unschedulable else max(0, total_gpus - allocated_gpus)
 
