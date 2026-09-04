@@ -48,6 +48,21 @@ _MIN_LONG_WORKERS = 1
 # Minimal number of idle short workers to ensure responsiveness.
 _MIN_IDLE_SHORT_WORKERS = 1
 
+
+def _positive_int_env(name: str, default: int) -> int:
+    """Reads a positive integer override, failing fast on bad config."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as e:
+        raise ValueError(
+            f'{name} must be a positive integer, got {value!r}') from e
+    if parsed < 1:
+        raise ValueError(f'{name} must be a positive integer, got {value!r}')
+    return parsed
+
 # Default number of burstable workers for local API server. A heuristic number
 # that is large enough for most local cases.
 # TODO(aylei): the number of burstable workers should be auto-tuned based on the
@@ -144,6 +159,14 @@ def compute_server_config(
     # This could lead to performance degradation.
     num_db_connections_per_worker = 0
     num_server_workers = cpu_count
+
+    if deploy:
+        num_server_workers = _positive_int_env(
+            'SKYPILOT_API_SERVER_WORKERS', num_server_workers)
+        max_parallel_for_long = _positive_int_env(
+            'SKYPILOT_API_LONG_WORKERS', max_parallel_for_long)
+        max_parallel_for_short = _positive_int_env(
+            'SKYPILOT_API_SHORT_WORKERS', max_parallel_for_short)
 
     # +1 for the event loop running the main process
     # and gc daemons in the '__main__' body of sky/server/server.py

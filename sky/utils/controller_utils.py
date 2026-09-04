@@ -1348,7 +1348,25 @@ MAXIMUM_CONTROLLER_RESERVED_MEMORY_MB = 2048
 POOL_JOBS_RESOURCES_RATIO = 1
 # Number of ongoing launches launches allowed per worker. Can probably be
 # increased a bit to around 16 but keeping it lower to just to be safe
-LAUNCHES_PER_WORKER = 8
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    """Reads a positive integer override, failing fast on bad config."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as e:
+        raise ValueError(
+            f'{name} must be a positive integer, got {value!r}') from e
+    if parsed < 1:
+        raise ValueError(f'{name} must be a positive integer, got {value!r}')
+    return parsed
+
+
+LAUNCHES_PER_WORKER = _positive_int_env(
+    'SKYPILOT_JOBS_LAUNCHES_PER_CONTROLLER', 8)
 # Number of ongoing launches allowed per service. Can probably be increased
 # a bit as well.
 LAUNCHES_PER_SERVICE = 4
@@ -1593,9 +1611,13 @@ def _get_parallelism(pool: bool, raw_resource_per_unit: float) -> int:
 
 
 def get_number_of_jobs_controllers() -> int:
-    return min(
+    computed = min(
         MAX_CONTROLLERS,
         _get_parallelism(pool=True, raw_resource_per_unit=JOB_WORKER_MEMORY_MB))
+    return min(
+        MAX_CONTROLLERS,
+        _positive_int_env('SKYPILOT_JOBS_CONTROLLERS', computed),
+    )
 
 
 @annotations.lru_cache(scope='global', maxsize=1)
