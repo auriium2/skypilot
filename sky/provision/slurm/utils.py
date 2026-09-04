@@ -81,6 +81,99 @@ def _tres_gpu_count(tres: str) -> int:
     return int(match.group(1)) if match else 0
 
 
+def _tres_cpu_count(tres: str) -> int:
+    """Reads the cpu total from a TRES string."""
+    match = re.search(r'(?:^|,)cpu=(\d+)', tres)
+    return int(match.group(1)) if match else 0
+
+
+def _tres_mem_gb(tres: str) -> float:
+    """Reads the memory total from a TRES string, in GB.
+
+    Slurm prints mem with a unit suffix (mem=2321633M, mem=1624G).
+    """
+    match = re.search(r'(?:^|,)mem=([\d.]+)([KMGTP]?)', tres)
+    if not match:
+        return 0.0
+    value = float(match.group(1))
+    unit = match.group(2) or 'M'
+    factor = {
+        'K': 1 / (1024 * 1024),
+        'M': 1 / 1024,
+        'G': 1.0,
+        'T': 1024.0,
+        'P': 1024.0 * 1024,
+    }[unit]
+    return value * factor
+
+
+def _is_unschedulable_state(state: str) -> bool:
+    """Whether a node's state flag set contains an unschedulable flag."""
+    flags = set(state.upper().replace('+', '|').split('|'))
+    return bool(flags & _UNSCHEDULABLE_NODE_STATES)
+
+
+def _get_node_free_resources(cluster: str) -> Optional[Dict[str, Any]]:
+    """Free cpu, memory and GPUs per node, from CfgTRES minus AllocTRES.
+
+    Returns None when scontrol is unavailable, so callers can keep
+    capacity-only semantics rather than failing.
+    """
+    try:
+        ssh_config = get_slurm_ssh_config()
+        ssh_config_dict = ssh_config.lookup(cluster)
+        client = slurm.SlurmClient(
+            ssh_config_dict['hostname'],
+            int(ssh_config_dict.get('port', 22)),
+            ssh_config_dict['user'],
+            get_identity_file(ssh_config_dict),
+            ssh_proxy_command=ssh_config_dict.get('proxycommand', None),
+            ssh_proxy_jump=ssh_config_dict.get('proxyjump', None),
+            identities_only=get_identities_only(ssh_config_dict),
+        )
+        node_tres = client.get_all_node_tres()
+    except Exception as e:  # pylint: disable=broad-except
+        logger.debug(f'Could not fetch node TRES for free-resource '
+                     f'fit checking: {e}')
+        return None
+    free: Dict[str, Any] = {}
+    for node_name, tres in node_tres.items():
+        free[node_name] = {
+            'unschedulable': _is_unschedulable_state(tres['state']),
+            'cpus': (_tres_cpu_count(tres['cfg_tres']) -
+                     _tres_cpu_count(tres['alloc_tres'])),
+            'memory_gb': (_tres_mem_gb(tres['cfg_tres']) -
+                          _tres_mem_gb(tres['alloc_tres'])),
+            'gpus': (_tres_gpu_count(tres['cfg_tres']) -
+                     _tres_gpu_count(tres['alloc_tres'])),
+            'cfg_cpus': _tres_cpu_count(tres['cfg_tres']),
+            'cfg_memory_gb': _tres_mem_gb(tres['cfg_tres']),
+            'cfg_gpus': _tres_gpu_count(tres['cfg_tres']),
+            'partitions': [
+                p for p in tres.get('partitions', '').split(',') if p
+            ],
+        }
+    return free
+
+
+def _make_slurm_client(cluster: str) -> 'slurm.SlurmClient':
+    """Builds a SlurmClient for a cluster from the Slurm SSH config."""
+    ssh_config = get_slurm_ssh_config()
+    ssh_config_dict = ssh_config.lookup(cluster)
+    return slurm.SlurmClient(
+        ssh_config_dict['hostname'],
+        int(ssh_config_dict.get('port', 22)),
+        ssh_config_dict['user'],
+        get_identity_file(ssh_config_dict),
+        ssh_proxy_command=ssh_config_dict.get('proxycommand', None),
+        ssh_proxy_jump=ssh_config_dict.get('proxyjump', None),
+        identities_only=get_identities_only(ssh_config_dict),
+    )
+
+
+
+
+
 def get_gpu_type_and_count(gres_str: str) -> Tuple[Optional[str], int]:
     """Parses GPU type and count from a GRES string.
 
@@ -571,6 +664,57 @@ def _check_cpu_mem_fits(
                    f'{common_utils.format_float(max_mem_gb)}G memory')
 
 
+def _check_ever_satisfiable(
+        candidate_instance_type: SlurmInstanceType,
+        node_list: List[slurm.NodeInfo],
+        free_resources: Dict[str, Any],
+        acc_count: int) -> Tuple[bool, Optional[str]]:
+    """Checks whether some node could ever satisfy the request.
+
+    Pending behind other jobs is normal queueing, so what is *currently*
+    free never blocks acceptance. A request is refused only when it can
+    never run: it exceeds every schedulable node's configured CPUs, memory
+    or GPUs. Nodes absent from free_resources fall back to the
+    sinfo-derived capacity check.
+    """
+    skip_mem_check = candidate_instance_type.memory == 0
+
+    # Track the largest node seen, for the refusal message.
+    best_cpus = 0
+    best_mem_gb = 0.0
+    best_gpus = 0
+
+    for node_info in node_list:
+        res = free_resources.get(node_info.node)
+        if res is None:
+            cpu_fits = node_info.cpus >= candidate_instance_type.cpus
+            mem_fits = (skip_mem_check or
+                        node_info.memory_gb >= candidate_instance_type.memory)
+            if cpu_fits and mem_fits:
+                return True, None
+            continue
+        if res['unschedulable']:
+            continue
+        usable_gpus = res['cfg_gpus']
+        if usable_gpus > best_gpus:
+            best_gpus = usable_gpus
+        if res['cfg_cpus'] > best_cpus:
+            best_cpus = res['cfg_cpus']
+            best_mem_gb = res['cfg_memory_gb']
+        cpu_fits = res['cfg_cpus'] >= candidate_instance_type.cpus
+        mem_fits = (skip_mem_check or
+                    res['cfg_memory_gb'] >= candidate_instance_type.memory)
+        gpu_fits = usable_gpus >= acc_count
+        if cpu_fits and mem_fits and gpu_fits:
+            return True, None
+
+    reason = (f'No schedulable node can ever satisfy this request. '
+              f'Largest node: {best_cpus} CPUs, '
+              f'{common_utils.format_float(best_mem_gb)}G memory, '
+              f'{best_gpus} usable GPUs.')
+    return False, reason
+
+
 def check_instance_fits(
         cluster: str,
         instance_type: str,
@@ -686,9 +830,18 @@ def check_instance_fits(
                 f'GPU nodes with {acc_type}{partition_suffix} do not '
                 f'have enough {req_str}. ')
 
-    # Check if CPU and memory requirements are met on at least one
-    # candidate node.
-    fits, reason = _check_cpu_mem_fits(slurm_instance_type, candidate_nodes)
+    # Refuse only requests that can never run: over every schedulable
+    # node's configured resources. Requests over what is merely free right
+    # now are queueable and pass through to Slurm. Falls back to the sinfo
+    # capacity check when scontrol is restricted.
+    free_resources = _get_node_free_resources(cluster)
+    if free_resources is not None:
+        fits, reason = _check_ever_satisfiable(slurm_instance_type,
+                                               candidate_nodes,
+                                               free_resources, acc_count)
+    else:
+        fits, reason = _check_cpu_mem_fits(slurm_instance_type,
+                                           candidate_nodes)
     if not fits and reason is not None:
         reason = not_fit_reason_prefix + reason
     return fits, reason
