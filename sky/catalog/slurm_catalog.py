@@ -176,6 +176,8 @@ def list_accelerators_realtime(
                    Set[common.InstanceTypeInfo]] = collections.defaultdict(set)
     total_capacity: Dict[str, int] = collections.defaultdict(int)
     total_available: Dict[str, int] = collections.defaultdict(int)
+    available_per_cluster: Dict[Tuple[str, str],
+                                int] = collections.defaultdict(int)
 
     for node_info in slurm_nodes_info:
         gpu_type = node_info['gpu_type']
@@ -238,6 +240,8 @@ def list_accelerators_realtime(
 
         total_capacity[gpu_type] += node_total_gpus
         total_available[gpu_type] += node_free_gpus
+        available_per_cluster[(node_info['slurm_cluster_name'],
+                               gpu_type)] += node_free_gpus
 
     if not total_capacity:
         err_msg = 'No matching GPU nodes found in the Slurm cluster'
@@ -251,6 +255,32 @@ def list_accelerators_realtime(
         err_msg += '.'
         logger.error(err_msg)
         raise ValueError(err_msg)
+
+    # Cap availability by the user's QOS headroom: a free GPU beyond the
+    # partition QOS's per-user limit cannot be acquired, so counting it
+    # overstates what a request can get. Capacity is left physical.
+    for cluster in clusters_to_query:
+        try:
+            reachable = slurm_utils.get_qos_capped_free_gpus(cluster)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.debug(f'Could not compute QOS-capped availability for '
+                         f'{cluster}: {e}')
+            continue
+        if not reachable:
+            continue
+        canonical_reachable: Dict[str, int] = {}
+        for raw_type, count in reachable.items():
+            gpu_type = (slurm_utils.canonicalize_raw_gpu_name(raw_type)
+                        if raw_type != 'GPU' else 'GPU')
+            canonical_reachable[gpu_type] = (
+                canonical_reachable.get(gpu_type, 0) + count)
+        for gpu_type in list(total_available.keys()):
+            key = (cluster, gpu_type)
+            if key not in available_per_cluster:
+                continue
+            capped = min(available_per_cluster[key],
+                         canonical_reachable.get(gpu_type, 0))
+            total_available[gpu_type] += capped - available_per_cluster[key]
 
     final_qtys_map = {
         gpu: sorted(instances, key=lambda x: x.accelerator_count)

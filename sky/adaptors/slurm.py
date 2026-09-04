@@ -355,8 +355,81 @@ class SlurmClient:
                 'gres': fields.get('Gres', ''),
                 'cfg_tres': fields.get('CfgTRES', ''),
                 'alloc_tres': fields.get('AllocTRES', ''),
+                'partitions': fields.get('Partitions', ''),
             }
         return nodes
+
+    def get_partition_qos(self) -> Dict[str, Optional[str]]:
+        """Gets each partition's QOS name.
+
+        Returns:
+            Dict mapping partition name to its QoS, or None when unset.
+        """
+        cmd = 'scontrol show partitions -o'
+        rc, stdout, stderr = self._run_slurm_cmd(cmd)
+        subprocess_utils.handle_returncode(rc,
+                                           cmd,
+                                           'Failed to get partition QOS.',
+                                           stderr=f'{stdout}\n{stderr}',
+                                           stream_logs=False)
+        partition_qos: Dict[str, Optional[str]] = {}
+        for line in stdout.splitlines():
+            name_match = _PARTITION_NAME_REGEX.search(line)
+            if not name_match:
+                continue
+            qos_match = re.search(r'\bQoS=(\S+)', line)
+            qos = qos_match.group(1) if qos_match else None
+            if qos == 'N/A':
+                qos = None
+            partition_qos[name_match.group(1).strip()] = qos
+        return partition_qos
+
+    def get_qos_max_tres_per_user(self) -> Dict[str, str]:
+        """Gets each QOS's MaxTRESPerUser string from sacctmgr.
+
+        Returns:
+            Dict mapping QOS name to its raw MaxTRESPerUser TRES string
+            (may be empty for unlimited). Empty dict when sacctmgr is
+            unavailable, so callers can degrade to QOS-unaware behavior.
+        """
+        cmd = 'sacctmgr -nP show qos format=name,maxtrespu'
+        rc, stdout, stderr = self._run_slurm_cmd(cmd)
+        if rc != 0:
+            logger.debug(f'sacctmgr unavailable, skipping QOS limits: '
+                         f'{stderr}')
+            return {}
+        limits: Dict[str, str] = {}
+        for line in stdout.splitlines():
+            if '|' not in line:
+                continue
+            name, tres = line.split('|', 1)
+            limits[name.strip()] = tres.strip()
+        return limits
+
+    def get_my_running_tres_per_partition(self) -> Dict[str, List[str]]:
+        """Gets this user's running allocations, grouped by partition.
+
+        Returns:
+            Dict mapping partition name to the TRES strings of the user's
+            running jobs there.
+        """
+        cmd = ('squeue --me --states=running -h '
+               '-O "Partition:50,tres-alloc:250"')
+        rc, stdout, stderr = self._run_slurm_cmd(cmd)
+        subprocess_utils.handle_returncode(rc,
+                                           cmd,
+                                           'Failed to get own running jobs.',
+                                           stderr=f'{stdout}\n{stderr}',
+                                           stream_logs=False)
+        usage: Dict[str, List[str]] = {}
+        for line in stdout.splitlines():
+            parts = line.split(None, 1)
+            if not parts:
+                continue
+            partition = parts[0]
+            tres = parts[1].strip() if len(parts) > 1 else ''
+            usage.setdefault(partition, []).append(tres)
+        return usage
 
     def get_all_jobs_gres(self) -> Dict[str, List[str]]:
         """Get GRES allocation for all running jobs, grouped by node.

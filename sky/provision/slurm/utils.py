@@ -171,7 +171,105 @@ def _make_slurm_client(cluster: str) -> 'slurm.SlurmClient':
     )
 
 
+def get_partition_gpu_caps(cluster: str) -> Dict[str, Optional[int]]:
+    """Each partition's per-user GPU cap from its QOS MaxTRESPerUser.
 
+    A partition maps to None when its QOS carries no per-user GPU cap.
+    Returns an empty dict when sacctmgr is unavailable, so callers degrade
+    to QOS-unaware behavior.
+    """
+    client = _make_slurm_client(cluster)
+    qos_limits = client.get_qos_max_tres_per_user()
+    if not qos_limits:
+        return {}
+    try:
+        partition_qos = client.get_partition_qos()
+    except Exception as e:  # pylint: disable=broad-except
+        logger.debug(f'Could not fetch partition QOS: {e}')
+        return {}
+    caps: Dict[str, Optional[int]] = {}
+    for partition, qos in partition_qos.items():
+        cap: Optional[int] = None
+        if qos is not None and qos in qos_limits:
+            match = re.search(r'gres/gpu=(\d+)', qos_limits[qos])
+            if match:
+                cap = int(match.group(1))
+        caps[partition] = cap
+    return caps
+
+
+def get_partition_gpu_headroom(cluster: str) -> Dict[str, Optional[int]]:
+    """GPUs this user may still acquire in each partition, per QOS limits.
+
+    The per-partition cap minus the user's running usage there. A partition
+    maps to None when its QOS carries no per-user GPU cap. Returns an empty
+    dict when sacctmgr is unavailable, so callers degrade to QOS-unaware
+    behavior.
+    """
+    caps = get_partition_gpu_caps(cluster)
+    if not caps:
+        return {}
+    try:
+        my_usage = _make_slurm_client(
+            cluster).get_my_running_tres_per_partition()
+    except Exception as e:  # pylint: disable=broad-except
+        logger.debug(f'Could not fetch own running usage: {e}')
+        return {}
+    headroom: Dict[str, Optional[int]] = {}
+    for partition, cap in caps.items():
+        if cap is None:
+            headroom[partition] = None
+            continue
+        used = sum(
+            _tres_gpu_count(tres) for tres in my_usage.get(partition, []))
+        headroom[partition] = max(0, cap - used)
+    return headroom
+
+
+def get_qos_capped_free_gpus(cluster: str) -> Dict[str, int]:
+    """Free GPUs per type, capped by this user's QOS headroom.
+
+    A GPU is reachable only through some partition, and each partition's QOS
+    caps what one user may hold there, so the reachable count is
+    sum over partitions of min(free in partition, headroom), never exceeding
+    the physical free total (nodes in several partitions are not additive).
+    Returns an empty dict when QOS limits cannot be read.
+    """
+    headroom = get_partition_gpu_headroom(cluster)
+    if not headroom:
+        return {}
+    client = _make_slurm_client(cluster)
+    node_tres = client.get_all_node_tres()
+
+    physical_free: Dict[str, int] = {}
+    per_partition_free: Dict[str, Dict[str, int]] = {}
+    for tres in node_tres.values():
+        free = max(
+            0,
+            _tres_gpu_count(tres['cfg_tres']) -
+            _tres_gpu_count(tres['alloc_tres']))
+        if not free or _is_unschedulable_state(tres['state']):
+            continue
+        gpu_type, _ = get_gpu_type_and_count(tres['gres'])
+        if gpu_type is None:
+            gpu_type = 'GPU'
+        physical_free[gpu_type] = physical_free.get(gpu_type, 0) + free
+        partitions = [p for p in tres['partitions'].split(',') if p]
+        by_partition = per_partition_free.setdefault(gpu_type, {})
+        for partition in partitions:
+            by_partition[partition] = by_partition.get(partition, 0) + free
+
+    reachable: Dict[str, int] = {}
+    for gpu_type, by_partition in per_partition_free.items():
+        # A multi-partition node's GPUs count once per partition here, which
+        # is correct for summing per-partition caps but must not exceed the
+        # physical free total.
+        total = 0
+        for partition, free in by_partition.items():
+            cap = headroom.get(partition)
+            total += free if cap is None else min(free, cap)
+        reachable[gpu_type] = min(total, physical_free[gpu_type])
+    return reachable
 
 
 def get_gpu_type_and_count(gres_str: str) -> Tuple[Optional[str], int]:
@@ -668,14 +766,18 @@ def _check_ever_satisfiable(
         candidate_instance_type: SlurmInstanceType,
         node_list: List[slurm.NodeInfo],
         free_resources: Dict[str, Any],
-        acc_count: int) -> Tuple[bool, Optional[str]]:
+        acc_count: int,
+        gpu_caps: Optional[Dict[str, Optional[int]]] = None
+) -> Tuple[bool, Optional[str]]:
     """Checks whether some node could ever satisfy the request.
 
     Pending behind other jobs is normal queueing, so what is *currently*
     free never blocks acceptance. A request is refused only when it can
     never run: it exceeds every schedulable node's configured CPUs, memory
-    or GPUs. Nodes absent from free_resources fall back to the
-    sinfo-derived capacity check.
+    or GPUs, or the per-user QOS cap of every partition through which a
+    big-enough node is reachable (Slurm rejects such an sbatch outright
+    with QOSMaxGRESPerUser). Nodes absent from free_resources fall back to
+    the sinfo-derived capacity check.
     """
     skip_mem_check = candidate_instance_type.memory == 0
 
@@ -683,6 +785,16 @@ def _check_ever_satisfiable(
     best_cpus = 0
     best_mem_gb = 0.0
     best_gpus = 0
+    qos_blocked = False
+
+    def node_gpu_cap(res: Dict[str, Any]) -> Optional[int]:
+        """The best per-user QOS cap among the node's partitions."""
+        if not gpu_caps or not res['partitions']:
+            return None
+        caps = [gpu_caps.get(p) for p in res['partitions']]
+        if any(c is None for c in caps):
+            return None
+        return max(caps)
 
     for node_info in node_list:
         res = free_resources.get(node_info.node)
@@ -696,6 +808,11 @@ def _check_ever_satisfiable(
         if res['unschedulable']:
             continue
         usable_gpus = res['cfg_gpus']
+        cap = node_gpu_cap(res)
+        if cap is not None and cap < usable_gpus:
+            if res['cfg_gpus'] >= acc_count > cap:
+                qos_blocked = True
+            usable_gpus = cap
         if usable_gpus > best_gpus:
             best_gpus = usable_gpus
         if res['cfg_cpus'] > best_cpus:
@@ -712,6 +829,9 @@ def _check_ever_satisfiable(
               f'Largest node: {best_cpus} CPUs, '
               f'{common_utils.format_float(best_mem_gb)}G memory, '
               f'{best_gpus} usable GPUs.')
+    if qos_blocked:
+        reason += (' Some nodes have enough GPUs, but the partition QOS '
+                   'caps this user below the requested count.')
     return False, reason
 
 
@@ -831,14 +951,30 @@ def check_instance_fits(
                 f'have enough {req_str}. ')
 
     # Refuse only requests that can never run: over every schedulable
-    # node's configured resources. Requests over what is merely free right
-    # now are queueable and pass through to Slurm. Falls back to the sinfo
-    # capacity check when scontrol is restricted.
+    # node's configured resources, or over the per-user QOS cap. Requests
+    # over what is merely free right now are queueable and pass through to
+    # Slurm. Falls back to the sinfo capacity check when scontrol is
+    # restricted.
     free_resources = _get_node_free_resources(cluster)
     if free_resources is not None:
+        gpu_caps = None
+        if acc_count > 0:
+            try:
+                caps = get_partition_gpu_caps(cluster)
+                if caps and partition is not None:
+                    # A partition-pinned request can only use that
+                    # partition's cap.
+                    caps = {
+                        p: (c if p == partition else 0)
+                        for p, c in caps.items()
+                    }
+                gpu_caps = caps or None
+            except Exception as e:  # pylint: disable=broad-except
+                logger.debug(f'Could not fetch QOS GPU caps: {e}')
         fits, reason = _check_ever_satisfiable(slurm_instance_type,
                                                candidate_nodes,
-                                               free_resources, acc_count)
+                                               free_resources, acc_count,
+                                               gpu_caps)
     else:
         fits, reason = _check_cpu_mem_fits(slurm_instance_type,
                                            candidate_nodes)
