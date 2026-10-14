@@ -493,6 +493,8 @@ def _create_virtual_instance(
     provision_scripts_dir = os.path.dirname(provision_script_path)
 
     skypilot_runtime_dir = _skypilot_runtime_dir(tmpdir, cluster_name_on_cloud)
+    storage_unmount_cmd = slurm_utils.get_storage_unmount_command(
+        skypilot_runtime_dir)
     sky_cluster_home_dir = _sky_cluster_home_dir(sky_base_dir,
                                                  cluster_name_on_cloud)
     ready_signal = f'{sky_cluster_home_dir}/.sky_sbatch_ready'
@@ -651,6 +653,7 @@ cleanup() {{
         kill $(cat "{skypilot_runtime_dir}/.sky/skylet_pid") 2>/dev/null || true
     fi
     echo "Cleaning up sky directories..."
+    srun --overlap --nodes={num_nodes} --ntasks-per-node=1 bash -c {shlex.quote(storage_unmount_cmd)} || true
     # Remove the per-node enroot container, if it exists.
     # This is only needed when container_scope=global.
     # When container_scope=job, named containers are removed automatically
@@ -662,7 +665,7 @@ cleanup() {{
     # that this srun will run on the same subset of nodes as the srun
     # that created the sky directories.
     srun --nodes={num_nodes} rm -rf {skypilot_runtime_dir}
-    rm -rf {sky_cluster_home_dir}
+    rm -rf --one-file-system {sky_cluster_home_dir}
     exit $saved_exit
 }}
 # Run cleanup on any exit, including container init failures.
@@ -1062,6 +1065,24 @@ def terminate_instances(
             f'Job for cluster {cluster_name_on_cloud} is already completing. '
             'No action needed.')
     else:
+        # Unmount while srun can still enter the allocation; its EXIT trap
+        # alone races scancel destroying the steps and their mount helpers.
+        if job_state == 'RUNNING' and cleanup_on_login:
+            cluster_info = get_cluster_info(provider_config.get('cluster', ''),
+                                            cluster_name_on_cloud,
+                                            provider_config=provider_config)
+            for runner in get_command_runners(cluster_info):
+                cmd = slurm_utils.get_storage_unmount_command(
+                    runner.skypilot_runtime_dir)
+                rc, stdout, stderr = runner.run(cmd,
+                                                require_outputs=True,
+                                                stream_logs=False)
+                subprocess_utils.handle_returncode(
+                    rc,
+                    cmd,
+                    'Failed to unmount Slurm storage before teardown.',
+                    stderr=f'{stdout}\n{stderr}',
+                    stream_logs=False)
         # For other states (e.g., RUNNING, SUSPENDED), send a TERM signal.
         client.cancel_jobs_by_name(cluster_name_on_cloud,
                                    signal='TERM',

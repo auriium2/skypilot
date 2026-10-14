@@ -338,6 +338,12 @@ class CommandRunner:
     def node_id(self) -> str:
         return '-'.join(str(x) for x in self.node)
 
+    def run_mount(self, cmd: str, mount_path: str,
+                  **kwargs) -> Union[int, Tuple[int, str, str]]:
+        """Run a storage mount command and wait until mounting completes."""
+        del mount_path
+        return self.run(cmd, **kwargs)
+
     def get_remote_home_dir(self) -> str:
         # Use pattern matching to extract home directory.
         # Some container images print MOTD when login shells start, which can
@@ -2129,6 +2135,38 @@ exec {ssh_command} srun --unbuffered --quiet --overlap {extra_srun_args}\\
     ) -> Union[int, Tuple[int, str, str]]:
         in_container = self.container_args is not None
         return self._run_via_srun(cmd, in_container=in_container, **kwargs)
+
+    def run_mount(self, cmd: str, mount_path: str,
+                  **kwargs) -> Union[int, Tuple[int, str, str]]:
+        """Keep the mounting step alive so proctrack/cgroup retains FUSE."""
+        state_dir = os.path.join(self.skypilot_runtime_dir, '.sky',
+                                 f'mount-{uuid.uuid4().hex}')
+        log = shlex.quote(f'{state_dir}/output')
+        status = shlex.quote(f'{state_dir}/status')
+        status_tmp = shlex.quote(f'{state_dir}/status.tmp')
+        target = f'$(eval echo {shlex.quote(mount_path)})'
+        mount_id_cmd = f'findmnt -rn -M "{target}" -o ID'
+        # run_in_background detaches srun on the login node, not inside a
+        # short-lived step. The step exits when this particular mount goes
+        # away (including remounts), or when the allocation is cancelled.
+        start_cmd = (f'mkdir -p {shlex.quote(state_dir)} && '
+                     f'( {cmd} ) > {log} 2>&1; mount_rc=$?; '
+                     f'mount_id=$({mount_id_cmd}); '
+                     f'printf "%s\\n" "$mount_rc" > {status_tmp}; '
+                     f'mv {status_tmp} {status}; '
+                     'if [ "$mount_rc" = 0 ] && [ -n "$mount_id" ]; then '
+                     f'while [ "$({mount_id_cmd})" = "$mount_id" ]; do '
+                     'sleep 1; done; fi')
+        result = self.run(start_cmd, run_in_background=True, **kwargs)
+        rc = result if isinstance(result, int) else result[0]
+        if rc != 0:
+            return result
+        wait_cmd = f'while [ ! -f {status} ]; do sleep 1; done'
+        return self.run(
+            f'timeout 600 bash -c {shlex.quote(wait_cmd)} || exit $?; '
+            f'cat {log}; read -r mount_rc < {status}; '
+            f'rm -f {log} {status}; rmdir {shlex.quote(state_dir)}; '
+            'exit "$mount_rc"', **kwargs)
 
     def run_driver(
         self,

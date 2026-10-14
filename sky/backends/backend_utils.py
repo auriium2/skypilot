@@ -3,6 +3,7 @@ import asyncio
 from datetime import datetime
 import enum
 import fnmatch
+import functools
 import hashlib
 import math
 import os
@@ -1842,6 +1843,7 @@ def parallel_data_transfer_to_nodes(
         log_path: str = os.devnull,
         stream_logs: bool = False,
         source_bashrc: bool = False,
+        run_mount: bool = False,
         num_threads: Optional[int] = None):
     """Runs a command on all nodes and optionally runs rsync from src->dst.
 
@@ -1854,6 +1856,7 @@ def parallel_data_transfer_to_nodes(
         log_path: str; Path to the log file
         stream_logs: bool; Whether to stream logs to stdout
         source_bashrc: bool; Source bashrc before running the command.
+        run_mount: bool; Use the runner's storage-mount process lifecycle.
         num_threads: Optional[int]; Number of threads to use.
     """
     style = colorama.Style
@@ -1862,11 +1865,13 @@ def parallel_data_transfer_to_nodes(
 
     def _sync_node(runner: 'command_runner.CommandRunner') -> None:
         if cmd is not None:
-            rc, stdout, stderr = runner.run(cmd,
-                                            log_path=log_path,
-                                            stream_logs=stream_logs,
-                                            require_outputs=True,
-                                            source_bashrc=source_bashrc)
+            run_cmd = (functools.partial(runner.run_mount, mount_path=target)
+                       if run_mount else runner.run)
+            rc, stdout, stderr = run_cmd(cmd,
+                                         log_path=log_path,
+                                         stream_logs=stream_logs,
+                                         require_outputs=True,
+                                         source_bashrc=source_bashrc)
             err_msg = (f'{colorama.Style.RESET_ALL}{colorama.Style.DIM}'
                        f'----- CMD -----\n'
                        f'{cmd}\n'

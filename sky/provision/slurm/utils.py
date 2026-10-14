@@ -4,6 +4,7 @@ import math
 import os
 import re
 import shlex
+import textwrap
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -42,6 +43,23 @@ _SLURM_PROCTRACK_TYPE_CACHE_TTL = 24 * 60 * 60
 _SLURM_PYXIS_CHECK_CACHE_TTL = 24 * 60 * 60
 # FUSE availability is unlikely to change frequently.
 _SLURM_FUSE_CHECK_CACHE_TTL = 24 * 60 * 60
+
+
+def get_storage_unmount_command(runtime_dir: str) -> str:
+    """Unmount this allocation's registered storage before deleting its home."""
+    registry = shlex.quote(os.path.join(runtime_dir, '.sky', 'storage_mounts'))
+    return textwrap.dedent(f'''\
+        set -e
+        if [ -f {registry} ]; then
+            while IFS= read -r mount_path; do
+                if findmnt -rn -M "$mount_path" >/dev/null 2>&1; then
+                    (command -v fusermount3 >/dev/null 2>&1 && fusermount3 -uz "$mount_path") ||
+                    (command -v fusermount >/dev/null 2>&1 && fusermount -uz "$mount_path")
+                fi
+            done < {registry}
+            rm -f {registry}
+        fi
+    ''').strip()
 
 
 def expand_path_vars(path: str, env: Dict[str, str]) -> str:

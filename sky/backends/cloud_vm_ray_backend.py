@@ -6699,6 +6699,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                     run_rsync=False,
                     action_message=action_message,
                     log_path=log_path,
+                    run_mount=True,
                     # Need to source bashrc, as the cloud specific CLI or SDK
                     # may require PATH in bashrc.
                     source_bashrc=True,

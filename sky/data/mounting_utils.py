@@ -320,9 +320,16 @@ def get_gcs_mount_cmd(bucket_name: str,
         if _bucket_sub_path else ''
     read_only_arg = '-o ro ' if read_only else ''
     log_file = '$(mktemp -t gcsfuse.XXXX.log)'
-    mount_cmd = (f'gcsfuse --log-file {log_file} '
+    # Unprivileged FUSE users may only request allow_other when fuse.conf
+    # permits it. Keep the existing shared-mount behavior where supported.
+    mount_cmd = ('GCSFUSE_ALLOW_OTHER=; '
+                 'if [ "$(id -u)" = 0 ] || '
+                 'grep -Eq "^[[:space:]]*user_allow_other([[:space:]]|$)" '
+                 '/etc/fuse.conf 2>/dev/null; then '
+                 'GCSFUSE_ALLOW_OTHER="-o allow_other"; fi; '
+                 f'gcsfuse --log-file {log_file} '
                  '--debug_fuse_errors '
-                 '-o allow_other '
+                 '$GCSFUSE_ALLOW_OTHER '
                  f'{read_only_arg}'
                  '--implicit-dirs '
                  f'--stat-cache-capacity {_STAT_CACHE_CAPACITY} '
@@ -862,14 +869,14 @@ def get_mounting_script(
         MOUNT_BINARY={mount_binary}
 
         # Check if path is already mounted
-        if findmnt -rn -T "$MOUNT_PATH" >/dev/null 2>&1; then
+        if findmnt -rn -M "$MOUNT_PATH" >/dev/null 2>&1; then
             echo "Path already mounted - unmounting..."
-            (command -v fusermount >/dev/null 2>&1 && fusermount -uz "$MOUNT_PATH") \
-            || (command -v fusermount3 >/dev/null 2>&1 && fusermount3 -uz "$MOUNT_PATH") \
-            || sudo umount -l "$MOUNT_PATH" || true
+            (command -v fusermount3 >/dev/null 2>&1 && fusermount3 -uz "$MOUNT_PATH") \
+            || (command -v fusermount >/dev/null 2>&1 && fusermount -uz "$MOUNT_PATH") \
+            || sudo -n umount -l "$MOUNT_PATH"
             # Ensure it's really gone (avoids races)
             for i in $(seq 1 20); do
-                if ! findmnt -rn -T "$MOUNT_PATH" >/dev/null 2>&1; then break; fi
+                if ! findmnt -rn -M "$MOUNT_PATH" >/dev/null 2>&1; then break; fi
                 sleep 0.2
             done
             echo "Successfully unmounted $MOUNT_PATH."
@@ -886,14 +893,17 @@ def get_mounting_script(
         # Check if mount path exists
         if [ ! -d "$MOUNT_PATH" ]; then
           echo "Mount path $MOUNT_PATH does not exist. Creating..."
-          sudo mkdir -p "$MOUNT_PATH"
-          sudo chmod 777 "$MOUNT_PATH"
+          if ! mkdir -p "$MOUNT_PATH" 2>/dev/null; then
+            sudo -n mkdir -p "$MOUNT_PATH"
+            sudo -n chmod 777 "$MOUNT_PATH"
+          fi
         else
-            # If not a mountpoint and contains files, clean it to satisfy SkyPilot check
-            if ! findmnt -rn -T "$MOUNT_PATH" >/dev/null 2>&1; then
+            # An existing directory is not necessarily a mount: -T would
+            # match its parent filesystem. Do not overwrite its contents.
+            if ! findmnt -rn -M "$MOUNT_PATH" >/dev/null 2>&1; then
                 if [ -n "$(ls -A "$MOUNT_PATH" 2>/dev/null)" ]; then
-                  echo "Cleaning non-empty mount path before mount..."
-                  sudo bash -lc 'shopt -s dotglob nullglob; rm -rf --one-file-system -- '"$MOUNT_PATH"'/*' 2>/dev/null || true
+                  echo "Mount path $MOUNT_PATH is non-empty."
+                  exit {exceptions.MOUNT_PATH_NON_EMPTY_CODE}
                 fi
             fi
         fi
@@ -962,6 +972,12 @@ def get_mounting_script(
             fi
             # TODO(kevin): Print logs from blobfuse2, etc too for observability.
             exit $MOUNT_EXIT_CODE
+        fi
+        # Slurm's runtime directory is node-local; record mounts there so
+        # allocation teardown can unmount before deleting the NFS job home.
+        if [ -n "${{SLURM_JOB_ID:-}}" ] && [ -n "${{SKY_RUNTIME_DIR:-}}" ]; then
+            mkdir -p "$SKY_RUNTIME_DIR/.sky"
+            printf '%s\\n' "$MOUNT_PATH" >> "$SKY_RUNTIME_DIR/.sky/storage_mounts"
         fi
         echo "Mounting done."
     """)
